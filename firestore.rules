@@ -1,0 +1,9 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Dev/emulator: open. Change to auth-based rules before prod.
+    match /{document=**} {
+      allow read, write: if request.time < timestamp.date(2100, 1, 1);
+    }
+  }
+}

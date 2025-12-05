@@ -1,0 +1,11 @@
+node_modules
+npm-debug.log*
+.DS_Store
+.env
+.env.*
+.firebaserc.backup*
+firebase-debug.log
+firestore-debug.log
+storage-debug.log
+functions/lib
+functions/node_modules

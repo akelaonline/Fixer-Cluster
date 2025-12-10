@@ -18,6 +18,15 @@ type ParsedSitemap =
   | { type: 'index'; sitemaps: { loc: string; lastmod?: string | null }[] }
   | { type: 'urlset'; urls: { loc: string; lastmod?: string | null }[] };
 
+type GscRow = {
+  url: string;
+  date: string; // YYYY-MM-DD
+  clicks: number;
+  impressions: number;
+  ctr: number;
+  position: number;
+};
+
 function makeUrlId(loc: string): string {
   return Buffer.from(loc).toString('base64url');
 }
@@ -97,6 +106,54 @@ async function saveUrls(siteId: string, sitemapUrl: string | null, urls: { loc: 
   );
 }
 
+async function saveGscRows(siteId: string, rows: GscRow[]) {
+  if (!rows || rows.length === 0) return;
+
+  const siteRef = db.collection('sites').doc(siteId);
+  const urlsCol = siteRef.collection('urls');
+
+  const batchSize = 400;
+  for (let i = 0; i < rows.length; i += batchSize) {
+    const slice = rows.slice(i, i + batchSize);
+    const batch = db.batch();
+
+    for (const r of slice) {
+      if (!r.url || !r.date) continue;
+      const urlId = makeUrlId(r.url);
+      const urlRef = urlsCol.doc(urlId);
+
+      batch.set(
+        urlRef,
+        {
+          loc: r.url,
+          source: 'sitemap-or-gsc',
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      const gscRef = urlRef.collection('gsc_daily').doc(r.date);
+      batch.set(
+        gscRef,
+        {
+          siteId,
+          urlId,
+          url: r.url,
+          date: r.date,
+          clicks: r.clicks,
+          impressions: r.impressions,
+          ctr: r.ctr,
+          position: r.position,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+
+    await batch.commit();
+  }
+}
+
 app.post('/ingest/sitemap', async (req: Request, res: Response) => {
   try {
     const { siteId, sitemapUrl } = req.body || {};
@@ -117,13 +174,28 @@ app.post('/ingest/gsc-mock', async (req: Request, res: Response) => {
     const { siteId, rows } = req.body || {};
     if (!siteId) return res.status(400).json({ error: 'siteId required' });
 
+    const normalizedRows: GscRow[] = Array.isArray(rows)
+      ? rows
+          .map((r: any) => ({
+            url: r.url,
+            date: r.date,
+            clicks: Number(r.clicks ?? 0),
+            impressions: Number(r.impressions ?? 0),
+            ctr: Number(r.ctr ?? 0),
+            position: Number(r.position ?? 0),
+          }))
+          .filter((r) => !!r.url && !!r.date)
+      : [];
+
     await db.collection('ingest_gsc_mock').add({
       siteId,
-      rows: rows ?? [],
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      rows: normalizedRows,
+      createdAt: FieldValue.serverTimestamp(),
     });
 
-    return res.json({ ok: true });
+    await saveGscRows(siteId, normalizedRows);
+
+    return res.json({ ok: true, count: normalizedRows.length });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: 'ingest_gsc_mock_failed' });

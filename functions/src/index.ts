@@ -319,7 +319,7 @@ async function saveGscRows(siteId: string, rows: GscRow[]) {
   const siteRef = db.collection('sites').doc(siteId);
   const urlsCol = siteRef.collection('urls');
 
-  const batchSize = 400;
+  const batchSize = 200;
   for (let i = 0; i < rows.length; i += batchSize) {
     const slice = rows.slice(i, i + batchSize);
     const batch = db.batch();

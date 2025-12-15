@@ -1,4 +1,4 @@
-import express, { Request, Response } from 'express';
+ import express, { Request, Response } from 'express';
 import * as functions from 'firebase-functions';
 import * as admin from 'firebase-admin';
 import axios from 'axios';
@@ -31,10 +31,52 @@ function makeUrlId(loc: string): string {
   return Buffer.from(loc).toString('base64url');
 }
 
+function isEmulator(): boolean {
+  return process.env.FUNCTIONS_EMULATOR === 'true';
+}
+
+function getIngestToken(): string | null {
+  const fromEnv = process.env.FIXER_INGEST_TOKEN;
+  const fromConfig = (functions.config()?.fixer?.ingest_token as string | undefined) ?? undefined;
+  return fromEnv ?? fromConfig ?? null;
+}
+
+function requireIngestAuth(req: Request, res: Response): boolean {
+  const expected = getIngestToken();
+  if (!expected) {
+    if (isEmulator()) return true;
+    res.status(500).json({ error: 'ingest_token_not_configured' });
+    return false;
+  }
+
+  const headerToken = req.get('x-fixer-token') || '';
+  const authHeader = req.get('authorization') || '';
+  const bearer = authHeader.toLowerCase().startsWith('bearer ') ? authHeader.slice(7) : authHeader;
+  const provided = headerToken || bearer;
+
+  if (provided !== expected) {
+    res.status(401).json({ error: 'unauthorized' });
+    return false;
+  }
+
+  return true;
+}
+
 async function fetchSitemap(url: string, depth = 0): Promise<{ urls: { loc: string; lastmod?: string | null }[] }> {
   if (depth > MAX_SITEMAP_DEPTH) return { urls: [] };
   const resp = await axios.get(url, { timeout: 15000 });
-  const parsed: unknown = parser.parse(resp.data);
+
+  const raw = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data);
+  functions.logger.info('fetchSitemap:response', {
+    url,
+    depth,
+    status: resp.status,
+    contentType: resp.headers['content-type'],
+    length: raw.length,
+    snippet: raw.slice(0, 500),
+  });
+
+  const parsed: unknown = parser.parse(raw);
 
   const sitemap = parseSitemap(parsed);
   if (sitemap.type === 'urlset') return { urls: sitemap.urls };
@@ -72,10 +114,18 @@ function parseSitemap(data: any): ParsedSitemap {
         .filter((e: any) => !!e.loc),
     };
   }
+  functions.logger.warn('parseSitemap:unrecognized-structure', {
+    topLevelKeys: Object.keys(data || {}),
+  });
   return { type: 'urlset', urls: [] };
 }
 
-async function saveUrls(siteId: string, sitemapUrl: string | null, urls: { loc: string; lastmod?: string | null }[]) {
+async function saveUrls(
+  siteId: string,
+  sitemapUrl: string | null,
+  urls: { loc: string; lastmod?: string | null }[],
+  source: 'sitemap' | 'direct'
+) {
   const siteRef = db.collection('sites').doc(siteId);
   const urlsCol = siteRef.collection('urls');
 
@@ -85,25 +135,26 @@ async function saveUrls(siteId: string, sitemapUrl: string | null, urls: { loc: 
     const batch = db.batch();
     for (const u of slice) {
       const docId = makeUrlId(u.loc);
-      batch.set(urlsCol.doc(docId), {
+      const urlData: { [key: string]: any } = {
         loc: u.loc,
-        lastmod: u.lastmod ?? null,
-        source: 'sitemap',
-        sitemapUrl: sitemapUrl ?? null,
+        source,
         fetchedAt: FieldValue.serverTimestamp(),
-      });
+      };
+      if (u.lastmod !== undefined) urlData.lastmod = u.lastmod ?? null;
+      if (sitemapUrl) urlData.sitemapUrl = sitemapUrl;
+
+      batch.set(urlsCol.doc(docId), urlData, { merge: true });
     }
     await batch.commit();
   }
 
-  await siteRef.set(
-    {
-      sitemapUrl: sitemapUrl ?? null,
-      urlCount: urls.length,
-      updatedAt: FieldValue.serverTimestamp(),
-    },
-    { merge: true }
-  );
+  const siteData: any = {
+    urlCount: urls.length,
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+  if (sitemapUrl) siteData.sitemapUrl = sitemapUrl;
+
+  await siteRef.set(siteData, { merge: true });
 }
 
 async function saveGscRows(siteId: string, rows: GscRow[]) {
@@ -155,12 +206,13 @@ async function saveGscRows(siteId: string, rows: GscRow[]) {
 }
 
 app.post('/ingest/sitemap', async (req: Request, res: Response) => {
+  if (!requireIngestAuth(req, res)) return;
   try {
     const { siteId, sitemapUrl } = req.body || {};
     if (!siteId || !sitemapUrl) return res.status(400).json({ error: 'siteId and sitemapUrl required' });
 
     const { urls } = await fetchSitemap(sitemapUrl);
-    await saveUrls(siteId, sitemapUrl, urls);
+    await saveUrls(siteId, sitemapUrl, urls, 'sitemap');
 
     return res.json({ ok: true, count: urls.length });
   } catch (err) {
@@ -169,7 +221,40 @@ app.post('/ingest/sitemap', async (req: Request, res: Response) => {
   }
 });
 
+app.post('/ingest/urls', async (req: Request, res: Response) => {
+  if (!requireIngestAuth(req, res)) return;
+  try {
+    const { siteId, urls } = req.body || {};
+    if (!siteId || !Array.isArray(urls)) return res.status(400).json({ error: 'siteId and urls required' });
+
+    const map = new Map<string, { loc: string; lastmod?: string | null }>();
+    for (const item of urls) {
+      const loc = typeof item === 'string' ? item : item?.loc;
+      if (!loc || typeof loc !== 'string') continue;
+      const normalizedLoc = loc.trim();
+      if (!normalizedLoc) continue;
+
+      const lastmod =
+        typeof item === 'object' && item
+          ? item.lastmod !== undefined
+            ? (item.lastmod ?? null)
+            : undefined
+          : undefined;
+      map.set(normalizedLoc, { loc: normalizedLoc, lastmod });
+    }
+
+    const normalized = Array.from(map.values());
+    await saveUrls(siteId, null, normalized, 'direct');
+
+    return res.json({ ok: true, count: normalized.length });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'ingest_urls_failed' });
+  }
+});
+
 app.post('/ingest/gsc-mock', async (req: Request, res: Response) => {
+  if (!requireIngestAuth(req, res)) return;
   try {
     const { siteId, rows } = req.body || {};
     if (!siteId) return res.status(400).json({ error: 'siteId required' });
@@ -203,6 +288,7 @@ app.post('/ingest/gsc-mock', async (req: Request, res: Response) => {
 });
 
 app.post('/actions/apply', async (req: Request, res: Response) => {
+  if (!requireIngestAuth(req, res)) return;
   try {
     const { siteId, actionId, payload } = req.body || {};
     if (!siteId || !actionId) {
@@ -213,7 +299,7 @@ app.post('/actions/apply', async (req: Request, res: Response) => {
       siteId,
       actionId,
       payload: payload ?? {},
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: FieldValue.serverTimestamp(),
     });
 
     return res.json({ ok: true });

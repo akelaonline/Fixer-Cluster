@@ -10,7 +10,7 @@ Este repo contiene, por ahora, solo el backend en Firebase Functions + Firestore
 
 ## Stack
 
-- Firebase Functions (Node 18, TypeScript).
+- Firebase Functions (Node 20, TypeScript).
 - Firestore (modo emulador en dev).
 - Storage (para futuros dumps de HTML / embeddings).
 - Java 21 (para Firestore emulator).
@@ -20,8 +20,8 @@ Este repo contiene, por ahora, solo el backend en Firebase Functions + Firestore
 ```text
 /firebase.json        # Config de emuladores y servicios
 /.firebaserc          # ProjectId por defecto (fixer-cluster)
-/firestore.rules      # Reglas de Firestore (abiertas para dev)
-/storage.rules        # Reglas de Storage (abiertas para dev)
+/firestore.rules      # Reglas de Firestore (cerradas por defecto)
+/storage.rules        # Reglas de Storage (cerradas por defecto)
 /functions/
   package.json        # Dependencias y scripts de Functions (TS)
   tsconfig.json       # Config de TypeScript
@@ -41,8 +41,8 @@ Colecciones usadas en esta primera versión:
 - `sites/{siteId}/urls/{urlId}`
   - `loc: string` (URL completa)
   - `lastmod: string | null` (desde el sitemap)
-  - `source: "sitemap"`
-  - `sitemapUrl: string | null`
+  - `source: "sitemap" | "direct" | "sitemap-or-gsc"`
+  - `sitemapUrl: string | null` (si aplica)
   - `fetchedAt: Timestamp`
 
 - `ingest_gsc_mock` (para pruebas)
@@ -62,9 +62,20 @@ Más adelante se añadirán colecciones para `clusters` y `gsc_data` reales.
 
 Todos colgados en la función HTTPS `api` (Express):
 
+En producción, los endpoints de escritura requieren auth por token en header:
+
+- `x-fixer-token: <TOKEN>`
+
+En emulador/local, si no hay token configurado, se permite.
+
 - `POST /ingest/sitemap`
   - Body JSON: `{ "siteId": string, "sitemapUrl": string }`
   - Acción: descarga el sitemap (índice o urlset), recorre hasta 3 niveles y guarda todas las URLs en `sites/{siteId}/urls`.
+  - Respuesta: `{ ok: true, count: number }`.
+
+- `POST /ingest/urls`
+  - Body JSON: `{ "siteId": string, "urls": string[] | { loc: string, lastmod?: string }[] }`
+  - Acción: ingesta directa de URLs (útil cuando un WAF/captcha bloquea el acceso al sitemap desde Cloud Functions). Guarda/mergea en `sites/{siteId}/urls`.
   - Respuesta: `{ ok: true, count: number }`.
 
 - `POST /ingest/gsc-mock`
@@ -79,7 +90,7 @@ Todos colgados en la función HTTPS `api` (Express):
 
 ### Requisitos
 
-- Node.js 18 recomendado para build/deploy (el host actual usa 23 para emulador, pero Functions está configurado con 18).
+- Node.js 20 recomendado para build/deploy.
 - Firebase CLI instalado (`firebase-tools`).
 - Java 21+ (instalado vía Homebrew: `brew install --cask temurin@21`).
 

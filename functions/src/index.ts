@@ -2,6 +2,7 @@
 import * as functions from 'firebase-functions';
 import * as admin from 'firebase-admin';
 import axios from 'axios';
+import { randomBytes } from 'crypto';
 import { XMLParser } from 'fast-xml-parser';
 import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 
@@ -60,6 +61,161 @@ function requireIngestAuth(req: Request, res: Response): boolean {
   }
 
   return true;
+}
+
+type GscOauthConfig = {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+};
+
+const GSC_SCOPE = 'https://www.googleapis.com/auth/webmasters.readonly';
+
+function getGscOauthConfig(): GscOauthConfig | null {
+  const clientId =
+    process.env.GSC_CLIENT_ID ??
+    ((functions.config()?.gsc?.client_id as string | undefined) ?? undefined) ??
+    null;
+  const clientSecret =
+    process.env.GSC_CLIENT_SECRET ??
+    ((functions.config()?.gsc?.client_secret as string | undefined) ?? undefined) ??
+    null;
+  const redirectUri =
+    process.env.GSC_REDIRECT_URI ??
+    ((functions.config()?.gsc?.redirect_uri as string | undefined) ?? undefined) ??
+    null;
+
+  if (!clientId || !clientSecret || !redirectUri) return null;
+  return { clientId, clientSecret, redirectUri };
+}
+
+function isValidIsoDate(value: any): value is string {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+function toIsoDate(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+function addDays(date: Date, days: number): Date {
+  const d = new Date(date.getTime());
+  d.setUTCDate(d.getUTCDate() + days);
+  return d;
+}
+
+async function getGscRefreshToken(): Promise<string | null> {
+  const fromEnv = process.env.GSC_REFRESH_TOKEN;
+  const fromConfig = (functions.config()?.gsc?.refresh_token as string | undefined) ?? undefined;
+  if (fromEnv || fromConfig) return fromEnv ?? fromConfig ?? null;
+
+  const snap = await db.collection('integrations').doc('gsc').get();
+  const token = snap.data()?.refreshToken;
+  if (typeof token === 'string' && token) return token;
+  return null;
+}
+
+let cachedGscAccessToken: string | null = null;
+let cachedGscAccessTokenExpiryMs = 0;
+
+async function refreshGscAccessToken(refreshToken: string): Promise<{ accessToken: string; expiryMs: number }> {
+  const cfg = getGscOauthConfig();
+  if (!cfg) throw new Error('gsc_oauth_config_missing');
+
+  const body = new URLSearchParams({
+    client_id: cfg.clientId,
+    client_secret: cfg.clientSecret,
+    refresh_token: refreshToken,
+    grant_type: 'refresh_token',
+  });
+
+  const resp = await axios.post('https://oauth2.googleapis.com/token', body.toString(), {
+    timeout: 20000,
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+  });
+
+  const accessToken = resp.data?.access_token;
+  const expiresIn = Number(resp.data?.expires_in ?? 0);
+  if (!accessToken || !expiresIn) throw new Error('gsc_token_refresh_failed');
+
+  const expiryMs = Date.now() + expiresIn * 1000;
+  cachedGscAccessToken = accessToken;
+  cachedGscAccessTokenExpiryMs = expiryMs;
+
+  return { accessToken, expiryMs };
+}
+
+async function getGscAccessToken(): Promise<string> {
+  if (cachedGscAccessToken && Date.now() < cachedGscAccessTokenExpiryMs - 60_000) return cachedGscAccessToken;
+  const refreshToken = await getGscRefreshToken();
+  if (!refreshToken) throw new Error('gsc_refresh_token_missing');
+  const { accessToken } = await refreshGscAccessToken(refreshToken);
+  return accessToken;
+}
+
+async function syncGscPageDate(siteId: string, gscSiteUrl: string, startDate: string, endDate: string, type = 'web') {
+  const rowLimit = 25_000;
+  let startRow = 0;
+  let total = 0;
+
+  while (true) {
+    const url = `https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(gscSiteUrl)}/searchAnalytics/query`;
+    const body = {
+      startDate,
+      endDate,
+      dimensions: ['date', 'page'],
+      type,
+      rowLimit,
+      startRow,
+    };
+
+    const makeRequest = async () => {
+      const token = await getGscAccessToken();
+      return axios.post(url, body, {
+        timeout: 30000,
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    };
+
+    let resp;
+    try {
+      resp = await makeRequest();
+    } catch (err: any) {
+      const status = err?.response?.status;
+      if (status === 401) {
+        cachedGscAccessToken = null;
+        cachedGscAccessTokenExpiryMs = 0;
+        resp = await makeRequest();
+      } else {
+        throw err;
+      }
+    }
+
+    const apiRows = Array.isArray(resp.data?.rows) ? resp.data.rows : [];
+    const rows: GscRow[] = apiRows
+      .map((r: any) => {
+        const date = Array.isArray(r.keys) ? r.keys[0] : null;
+        const page = Array.isArray(r.keys) ? r.keys[1] : null;
+        if (!date || !page) return null;
+        return {
+          url: String(page),
+          date: String(date),
+          clicks: Number(r.clicks ?? 0),
+          impressions: Number(r.impressions ?? 0),
+          ctr: Number(r.ctr ?? 0),
+          position: Number(r.position ?? 0),
+        };
+      })
+      .filter((r: any) => !!r && !!r.url && !!r.date);
+
+    await saveGscRows(siteId, rows);
+    total += rows.length;
+
+    if (apiRows.length < rowLimit) break;
+    startRow += rowLimit;
+    if (startRow >= 250_000) break;
+  }
+
+  return total;
 }
 
 async function fetchSitemap(url: string, depth = 0): Promise<{ urls: { loc: string; lastmod?: string | null }[] }> {
@@ -177,7 +333,6 @@ async function saveGscRows(siteId: string, rows: GscRow[]) {
         urlRef,
         {
           loc: r.url,
-          source: 'sitemap-or-gsc',
           updatedAt: FieldValue.serverTimestamp(),
         },
         { merge: true }
@@ -284,6 +439,200 @@ app.post('/ingest/gsc-mock', async (req: Request, res: Response) => {
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: 'ingest_gsc_mock_failed' });
+  }
+});
+
+app.get('/gsc/oauth/start', async (req: Request, res: Response) => {
+  if (!requireIngestAuth(req, res)) return;
+  try {
+    const cfg = getGscOauthConfig();
+    if (!cfg) return res.status(500).json({ error: 'gsc_oauth_config_missing' });
+
+    const state = randomBytes(24).toString('base64url');
+    const returnTo = typeof req.query.returnTo === 'string' ? req.query.returnTo : null;
+
+    await db
+      .collection('integrations')
+      .doc('gsc')
+      .collection('oauth_states')
+      .doc(state)
+      .set({
+        createdAtMs: Date.now(),
+        returnTo: returnTo ?? null,
+      });
+
+    const params = new URLSearchParams({
+      client_id: cfg.clientId,
+      redirect_uri: cfg.redirectUri,
+      response_type: 'code',
+      scope: GSC_SCOPE,
+      access_type: 'offline',
+      prompt: 'consent',
+      include_granted_scopes: 'true',
+      state,
+    });
+
+    const url = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+    const mode = typeof req.query.mode === 'string' ? req.query.mode : 'json';
+    if (mode === 'redirect') return res.redirect(url);
+    return res.json({ ok: true, url });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'gsc_oauth_start_failed' });
+  }
+});
+
+app.get('/gsc/oauth/callback', async (req: Request, res: Response) => {
+  try {
+    const oauthError = typeof req.query.error === 'string' ? req.query.error : null;
+    if (oauthError) return res.status(400).send(oauthError);
+
+    const code = typeof req.query.code === 'string' ? req.query.code : null;
+    const state = typeof req.query.state === 'string' ? req.query.state : null;
+    if (!code || !state) return res.status(400).send('missing_code_or_state');
+
+    const cfg = getGscOauthConfig();
+    if (!cfg) return res.status(500).send('gsc_oauth_config_missing');
+
+    const stateRef = db.collection('integrations').doc('gsc').collection('oauth_states').doc(state);
+    const stateSnap = await stateRef.get();
+    if (!stateSnap.exists) return res.status(400).send('invalid_state');
+    const createdAtMs = stateSnap.data()?.createdAtMs;
+    const returnTo = stateSnap.data()?.returnTo;
+    await stateRef.delete();
+
+    if (typeof createdAtMs === 'number' && Date.now() - createdAtMs > 20 * 60 * 1000) {
+      return res.status(400).send('state_expired');
+    }
+
+    const body = new URLSearchParams({
+      code,
+      client_id: cfg.clientId,
+      client_secret: cfg.clientSecret,
+      redirect_uri: cfg.redirectUri,
+      grant_type: 'authorization_code',
+    });
+
+    const tokenResp = await axios.post('https://oauth2.googleapis.com/token', body.toString(), {
+      timeout: 20000,
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    });
+
+    const refreshToken = tokenResp.data?.refresh_token;
+    const integrationRef = db.collection('integrations').doc('gsc');
+
+    if (refreshToken) {
+      await integrationRef.set(
+        {
+          refreshToken,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    } else {
+      const existing = await integrationRef.get();
+      const existingToken = existing.data()?.refreshToken;
+      if (!existingToken) return res.status(400).send('missing_refresh_token');
+      await integrationRef.set({ updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+    }
+
+    if (typeof returnTo === 'string' && returnTo) return res.redirect(returnTo);
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+    return res.status(200).send('<html><body>ok</body></html>');
+  } catch (err) {
+    console.error(err);
+    return res.status(500).send('gsc_oauth_callback_failed');
+  }
+});
+
+app.get('/gsc/status', async (req: Request, res: Response) => {
+  if (!requireIngestAuth(req, res)) return;
+  try {
+    const refreshToken = await getGscRefreshToken();
+    return res.json({ ok: true, hasRefreshToken: !!refreshToken });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'gsc_status_failed' });
+  }
+});
+
+app.get('/gsc/sites', async (req: Request, res: Response) => {
+  if (!requireIngestAuth(req, res)) return;
+  try {
+    const token = await getGscAccessToken();
+    const resp = await axios.get('https://www.googleapis.com/webmasters/v3/sites', {
+      timeout: 20000,
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    const entries = Array.isArray(resp.data?.siteEntry) ? resp.data.siteEntry : [];
+    return res.json({ ok: true, sites: entries });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'gsc_sites_failed' });
+  }
+});
+
+app.post('/gsc/site', async (req: Request, res: Response) => {
+  if (!requireIngestAuth(req, res)) return;
+  try {
+    const { siteId, gscSiteUrl } = req.body || {};
+    if (!siteId || !gscSiteUrl) return res.status(400).json({ error: 'siteId and gscSiteUrl required' });
+    if (typeof gscSiteUrl !== 'string') return res.status(400).json({ error: 'gscSiteUrl must be string' });
+
+    await db
+      .collection('sites')
+      .doc(siteId)
+      .set({ gscSiteUrl, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'gsc_site_set_failed' });
+  }
+});
+
+app.post('/gsc/sync', async (req: Request, res: Response) => {
+  if (!requireIngestAuth(req, res)) return;
+  try {
+    const { siteId } = req.body || {};
+    if (!siteId) return res.status(400).json({ error: 'siteId required' });
+
+    let gscSiteUrl = typeof req.body?.gscSiteUrl === 'string' ? req.body.gscSiteUrl : null;
+    const siteRef = db.collection('sites').doc(siteId);
+    if (!gscSiteUrl) {
+      const snap = await siteRef.get();
+      const fromDoc = snap.data()?.gscSiteUrl;
+      gscSiteUrl = typeof fromDoc === 'string' ? fromDoc : null;
+    }
+    if (!gscSiteUrl) return res.status(400).json({ error: 'gscSiteUrl required' });
+
+    const daysRaw = Number(req.body?.days ?? 7);
+    const days = Number.isFinite(daysRaw) ? Math.min(Math.max(daysRaw, 1), 90) : 7;
+
+    const endDate = isValidIsoDate(req.body?.endDate) ? req.body.endDate : toIsoDate(addDays(new Date(), -3));
+    const startDate = isValidIsoDate(req.body?.startDate)
+      ? req.body.startDate
+      : toIsoDate(addDays(new Date(endDate), -(days - 1)));
+
+    const type = typeof req.body?.type === 'string' ? req.body.type : 'web';
+    const count = await syncGscPageDate(siteId, gscSiteUrl, startDate, endDate, type);
+
+    await siteRef.set(
+      {
+        gscSiteUrl,
+        gscLastSyncAt: FieldValue.serverTimestamp(),
+        gscLastSyncStartDate: startDate,
+        gscLastSyncEndDate: endDate,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return res.json({ ok: true, siteId, gscSiteUrl, startDate, endDate, count });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'gsc_sync_failed' });
   }
 });
 
